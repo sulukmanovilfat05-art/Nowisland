@@ -462,7 +462,7 @@ jobs:
              col.addView(card(seek("Длительность (мс)", 1000, { p.animMs }, { p.animMs = it })))
 
              col.addView(label("ИНТЕРФЕЙС ПРИЛОЖЕНИЯ"))
-             col.addView(card(sw("Размытие фона (как в One UI)", { p.blurApp }, { p.blurApp = it; recreate() })))
+             col.addView(card(sw("Размытие фона (как в One UI)", { p.blurApp }, { recreate() }) { p.blurApp = it }))
 
              setContentView(ScrollView(this).apply { overScrollMode = View.OVER_SCROLL_NEVER; addView(col) })
              requestPermissions(arrayOf(android.Manifest.permission.READ_PHONE_STATE, android.Manifest.permission.ANSWER_PHONE_CALLS, android.Manifest.permission.POST_NOTIFICATIONS), 1)
@@ -498,7 +498,7 @@ jobs:
              }
          }
 
-         private fun sw(t: String, g: () -> Boolean, st: (Boolean) -> Unit, after: (() -> Unit)? = null) = Switch(this).apply {
+         private fun sw(t: String, g: () -> Boolean, after: (() -> Unit)? = null, st: (Boolean) -> Unit) = Switch(this).apply {
              text = t; textSize = 16f; setTextColor(Color.parseColor("#111111")); isChecked = g(); setPadding(0, dp(10), 0, dp(10))
              val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
              thumbTintList = ColorStateList(states, intArrayOf(Color.WHITE, Color.WHITE))
