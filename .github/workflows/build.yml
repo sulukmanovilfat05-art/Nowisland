@@ -71,8 +71,8 @@ jobs:
 
      class IslandNotifListener : NotificationListenerService() {
          override fun onListenerConnected() { refresh() }
-         override fun onNotificationPosted(sbn: StatusBarNotification) = refresh()
-         override fun onNotificationRemoved(sbn: StatusBarNotification) = refresh()
+         override fun onNotificationPosted(sbn: StatusBarNotification) { refresh() }
+         override fun onNotificationRemoved(sbn: StatusBarNotification) { refresh() }
 
          private fun refresh() {
              val nots = try { activeNotifications } catch (e: Exception) { return }
@@ -88,7 +88,7 @@ jobs:
              try {
                  val msm = getSystemService(MediaSessionManager::class.java)
                  IslandBus.media = msm.getActiveSessions(ComponentName(this, IslandNotifListener::class.java)).firstOrNull()
-             } catch (_: SecurityException) {}
+             } catch (e: SecurityException) {}
              IslandBus.notifyChanged()
          }
      }
@@ -182,7 +182,7 @@ jobs:
          }
 
          private fun destroyViews() {
-             try { wm.removeView(root) } catch (_: Exception) {}
+             try { wm.removeView(root) } catch (e: Exception) {}
          }
 
          private var sel = 0
@@ -270,7 +270,12 @@ jobs:
                      val ctl = LinearLayout(this).apply { gravity = Gravity.CENTER }
                      fun b(s: String, f: () -> Unit) = TextView(this).apply { text = s; textSize = 26f; setTextColor(Color.WHITE); setPadding(dp(22), 0, dp(22), 0); setOnClickListener { f() } }
                      ctl.addView(b("⏮") { IslandBus.media?.transportControls?.skipToPrevious() })
-                     ctl.addView(b("⏯") { val m = IslandBus.media; if (m?.playbackState?.state == PlaybackState.STATE_PLAYING) m.transportControls.pause() else m?.transportControls?.play() })
+                     ctl.addView(b("⏯") {
+                         val m = IslandBus.media
+                         if (m != null) {
+                             if (m.playbackState?.state == PlaybackState.STATE_PLAYING) m.transportControls.pause() else m.transportControls.play()
+                         }
+                     })
                      ctl.addView(b("⏭") { IslandBus.media?.transportControls?.skipToNext() })
                      content.addView(ctl)
                  }
@@ -281,9 +286,9 @@ jobs:
 
          private fun updateProgress() {
              val m = IslandBus.media ?: return
-             val dur = m.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0
-             val pos = m.playbackState?.position ?: 0
-             content.findViewWithTag<ProgressBar>("bar")?.progress = if (dur > 0) (pos * 1000 / dur).toInt() else 0
+             val dur: Long = m.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+             val pos: Long = m.playbackState?.position ?: 0L
+             content.findViewWithTag<ProgressBar>("bar")?.progress = if (dur > 0L) (pos * 1000L / dur).toInt() else 0
          }
 
          private fun pill(t: String, color: String, f: () -> Unit) = TextView(this).apply {
@@ -293,25 +298,26 @@ jobs:
          }
          private fun ringIcon(): Drawable {
              val r = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(2), Color.WHITE) }
-             return LayerDrawable(arrayOf(oval("#E53935"), r)).apply { val i = dp(7); setLayerInset(1, i, i, i, i) }
+             return LayerDrawable(arrayOf<Drawable>(oval("#E53935"), r)).apply { val i = dp(7); setLayerInset(1, i, i, i, i) }
          }
          private fun torchIcon(): Drawable {
              val r = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(2).toFloat() }
-             return LayerDrawable(arrayOf(oval("#2F6BFF"), r)).apply { setLayerInset(1, dp(11), dp(8), dp(11), dp(8)) }
+             return LayerDrawable(arrayOf<Drawable>(oval("#2F6BFF"), r)).apply { setLayerInset(1, dp(11), dp(8), dp(11), dp(8)) }
          }
-         private fun oval(c: String) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(c)) }
+         private fun oval(c: String): GradientDrawable = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(c)) }
 
          private fun toggle() { if (state != "media") return; expanded = !expanded; render() }
 
          private fun animateTo(w: Int, hg: Int) {
              val ow = lp.width; val oh = lp.height
              ValueAnimator.ofFloat(0f, 1f).apply {
-                 duration = prefs.animMs.toLong(); interpolator = if (expanded) OvershootInterpolator(1.1f) else ease
+                 duration = prefs.animMs.toLong()
+                 interpolator = if (expanded) OvershootInterpolator(1.1f) else ease
                  addUpdateListener { a ->
                      val f = a.animatedValue as Float
                      lp.width = (ow + (w - ow) * f).toInt(); lp.height = (oh + (hg - oh) * f).toInt()
                      (root.background as GradientDrawable).cornerRadius = corner()
-                     try { wm.updateViewLayout(root, lp) } catch (_: Exception) {}
+                     try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
                  }
                  start()
              }
@@ -323,17 +329,16 @@ jobs:
              }
          }
          private fun hide() {
-             root.animate().alpha(0f).scaleX(.6f).scaleY(.6f).setDuration(220).withEndAction {
+             root.animate().alpha(0f).scaleX(.6f).scaleY(.6f).setDuration(220L).withEndAction {
                  root.visibility = View.GONE; lp.width = dp(prefs.width); lp.height = dp(prefs.height)
-                 try { wm.updateViewLayout(root, lp) } catch (_: Exception) {}
+                 try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
              }.start()
          }
 
          override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
-             when (i?.action) {
-                 "reload" -> { destroyViews(); build(); state = "x"; update() }
-                 "test" -> { val t = i.getStringExtra("s"); forced = if (t == "off") null else t; state = "x"; update() }
-             }
+             val act = i?.action
+             if (act == "reload") { destroyViews(); build(); state = "x"; update() }
+             else if (act == "test") { val t = i?.getStringExtra("s"); forced = if (t == "off") null else t; state = "x"; update() }
              return START_STICKY
          }
          override fun onDestroy() {
@@ -348,29 +353,69 @@ jobs:
      class Prefs(c: Context) {
          private val p = c.getSharedPreferences("island", Context.MODE_PRIVATE)
          private fun i(k: String, d: Int) = p.getInt(k, d)
-         private fun s(k: String, v: Int) = p.edit().putInt(k, v).apply()
+         private fun s(k: String, v: Int) { p.edit().putInt(k, v).apply() }
          private fun b(k: String, d: Boolean) = p.getBoolean(k, d)
-         private fun sb(k: String, v: Boolean) = p.edit().putBoolean(k, v).apply()
-         var topMargin: Int get() = i("top", 7); set(v) = s("top", v)
-         var offsetX: Int get() = i("ox", 100); set(v) = s("ox", v)
-         var height: Int get() = i("h", 34); set(v) = s("h", v)
-         var width: Int get() = i("w", 108); set(v) = s("w", v)
-         var mediaWidth: Int get() = i("mw", 152); set(v) = s("mw", v)
-         var cardHeight: Int get() = i("ch", 130); set(v) = s("ch", v)
-         var radius: Int get() = i("rad", 24); set(v) = s("rad", v)
-         var textSize: Int get() = i("ts", 15); set(v) = s("ts", v)
-         var btnHeight: Int get() = i("bh", 46); set(v) = s("bh", v)
-         var animMs: Int get() = i("anim", 380); set(v) = s("anim", v)
-         var showMedia: Boolean get() = b("media", true); set(v) = sb("media", v)
-         var showCalls: Boolean get() = b("calls", true); set(v) = sb("calls", v)
-         var showTorch: Boolean get() = b("torch", true); set(v) = sb("torch", v)
-         var showRec: Boolean get() = b("rec", true); set(v) = sb("rec", v)
-         var showArtist: Boolean get() = b("artist", true); set(v) = sb("artist", v)
-         var showProgress: Boolean get() = b("prog", true); set(v) = sb("prog", v)
-         var showControls: Boolean get() = b("ctl", true); set(v) = sb("ctl", v)
-         var blurApp: Boolean get() = b("blur", true); set(v) = sb("blur", v)
-         var ansLabel: String get() = p.getString("ans", "Ответить") ?: "Ответить"; set(v) = p.edit().putString("ans", v).apply()
-         var decLabel: String get() = p.getString("dec", "Отклонить") ?: "Отклонить"; set(v) = p.edit().putString("dec", v).apply()
+         private fun sb(k: String, v: Boolean) { p.edit().putBoolean(k, v).apply() }
+         var topMargin: Int
+             get() = i("top", 7)
+             set(v) { s("top", v) }
+         var offsetX: Int
+             get() = i("ox", 100)
+             set(v) { s("ox", v) }
+         var height: Int
+             get() = i("h", 34)
+             set(v) { s("h", v) }
+         var width: Int
+             get() = i("w", 108)
+             set(v) { s("w", v) }
+         var mediaWidth: Int
+             get() = i("mw", 152)
+             set(v) { s("mw", v) }
+         var cardHeight: Int
+             get() = i("ch", 130)
+             set(v) { s("ch", v) }
+         var radius: Int
+             get() = i("rad", 24)
+             set(v) { s("rad", v) }
+         var textSize: Int
+             get() = i("ts", 15)
+             set(v) { s("ts", v) }
+         var btnHeight: Int
+             get() = i("bh", 46)
+             set(v) { s("bh", v) }
+         var animMs: Int
+             get() = i("anim", 380)
+             set(v) { s("anim", v) }
+         var showMedia: Boolean
+             get() = b("media", true)
+             set(v) { sb("media", v) }
+         var showCalls: Boolean
+             get() = b("calls", true)
+             set(v) { sb("calls", v) }
+         var showTorch: Boolean
+             get() = b("torch", true)
+             set(v) { sb("torch", v) }
+         var showRec: Boolean
+             get() = b("rec", true)
+             set(v) { sb("rec", v) }
+         var showArtist: Boolean
+             get() = b("artist", true)
+             set(v) { sb("artist", v) }
+         var showProgress: Boolean
+             get() = b("prog", true)
+             set(v) { sb("prog", v) }
+         var showControls: Boolean
+             get() = b("ctl", true)
+             set(v) { sb("ctl", v) }
+         var blurApp: Boolean
+             get() = b("blur", true)
+             set(v) { sb("blur", v) }
+         var ansLabel: String
+             get() = p.getString("ans", "Ответить") ?: "Ответить"
+             set(v) { p.edit().putString("ans", v).apply() }
+         var decLabel: String
+             get() = p.getString("dec", "Отклонить") ?: "Отклонить"
+             set(v) { p.edit().putString("dec", v).apply() }
          /** Размеры и положение, измеренные по видео (dp). */
          fun videoPreset() { topMargin = 7; offsetX = 100; height = 34; width = 108; mediaWidth = 152; radius = 24; textSize = 15; animMs = 380 }
      }
@@ -613,7 +658,7 @@ jobs:
      rootProject.name = "DynamicIsland"
      include ':app'
      EOF_FILE
-  - run: gradle :app:assembleRelease
+  - run: gradle :app:assembleRelease --stacktrace --console=plain
   - run: |
      mkdir -p module/system/priv-app/DynamicIsland
      cp app/build/outputs/apk/release/app-release.apk module/system/priv-app/DynamicIsland/DynamicIsland.apk
