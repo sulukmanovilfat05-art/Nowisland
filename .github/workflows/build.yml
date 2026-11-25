@@ -34,6 +34,7 @@ jobs:
          <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS"/>
          <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
          <uses-permission android:name="android.permission.VIBRATE"/>
+         <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
          <application android:label="Dynamic Island" android:icon="@drawable/ic_launcher" android:theme="@style/AppTheme">
              <activity android:name=".SettingsActivity" android:exported="true" android:theme="@style/SettingsTheme">
                  <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
@@ -63,6 +64,7 @@ jobs:
      cat > app/src/main/java/com/island/app/IslandNotifListener.kt <<'EOF_FILE'
      package com.island.app
      import android.app.Notification
+     import android.app.PendingIntent
      import android.content.ComponentName
      import android.media.session.MediaController
      import android.media.session.MediaSessionManager
@@ -70,21 +72,62 @@ jobs:
      import android.service.notification.StatusBarNotification
 
      class IslandNotifListener : NotificationListenerService() {
-         override fun onListenerConnected() { refresh() }
+         private val prefs by lazy { Prefs(applicationContext) }
+         private val clockPkgs = setOf("com.sec.android.app.clockpackage", "com.google.android.deskclock", "com.android.deskclock")
+         private val mapPkgs = setOf("com.google.android.apps.maps", "ru.yandex.yandexnavi", "ru.yandex.yandexmaps", "com.waze", "com.sygic.aura")
+         private val knownCats = setOf("navigation", "stopwatch", "alarm", "progress", "workout", "location_sharing")
+
+         override fun onListenerConnected() { IslandBus.requestRefresh = { refresh() }; refresh() }
+         override fun onListenerDisconnected() { IslandBus.requestRefresh = null }
          override fun onNotificationPosted(sbn: StatusBarNotification) { refresh() }
          override fun onNotificationRemoved(sbn: StatusBarNotification) { refresh() }
+
+         private fun toLive(sbn: StatusBarNotification): LiveInfo? {
+             val n = sbn.notification
+             val pkg = sbn.packageName
+             if (pkg == packageName || pkg == "android" || pkg == "com.android.systemui") return null
+             if (n.category == Notification.CATEGORY_CALL) return null
+             if ((n.flags and Notification.FLAG_ONGOING_EVENT) == 0) return null
+             if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return null
+             val ex = n.extras
+             if (ex.containsKey(Notification.EXTRA_MEDIA_SESSION)) return null
+             val cat = n.category ?: ""
+             val chrono = ex.getBoolean("android.showChronometer", false)
+             val pmax = ex.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
+             val indet = ex.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)
+             val ok = prefs.allOngoing || chrono || knownCats.contains(cat) || clockPkgs.contains(pkg) || mapPkgs.contains(pkg) || (pmax > 0 && !indet)
+             if (!ok) return null
+             val pm = packageManager
+             val label = try { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() } catch (e: Exception) { pkg }
+             val title = (ex.getCharSequence(Notification.EXTRA_TITLE) ?: "").toString().ifEmpty { label }
+             val text = (ex.getCharSequence(Notification.EXTRA_TEXT) ?: ex.getCharSequence(Notification.EXTRA_SUB_TEXT) ?: "").toString()
+             val acts = ArrayList<Notification.Action>()
+             val src = n.actions
+             if (src != null) { for (a in src) acts.add(a) }
+             return LiveInfo(sbn.key, pkg, label, title, text, chrono, ex.getBoolean("android.chronometerCountDown", false), n.`when`, ex.getInt(Notification.EXTRA_PROGRESS, 0), pmax, indet, acts, n.contentIntent)
+         }
 
          private fun refresh() {
              val nots = try { activeNotifications } catch (e: Exception) { return }
              val call = nots.firstOrNull { it.notification.category == Notification.CATEGORY_CALL && (it.notification.actions?.size ?: 0) >= 1 }
              IslandBus.call = call?.let {
                  val acts = it.notification.actions
-                 val ans = acts.firstOrNull { a -> a.title.toString().matches(Regex("(?i).*(answer|accept|ответ|принять).*")) } ?: acts.first()
-                 val dec = acts.firstOrNull { a -> a.title.toString().matches(Regex("(?i).*(decline|reject|hang|отклон|сброс).*")) } ?: acts.last()
-                 CallInfo(it.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "Входящий вызов", ans, dec)
+                 val ans = acts.firstOrNull { a -> a.title.toString().matches(Regex("(?i).*(answer|accept|ответ|принять).*")) }
+                 if (ans == null) null else {
+                     val dec = acts.firstOrNull { a -> a !== ans && a.title.toString().matches(Regex("(?i).*(decline|reject|hang|отклон|сброс).*")) } ?: acts.last()
+                     CallInfo(it.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: "Входящий вызов", ans, dec)
+                 }
              }
              IslandBus.recording = nots.any { it.packageName == "com.android.systemui" &&
                  (it.notification.channelId?.contains("screen", true) == true) }
+             val lives = ArrayList<LiveInfo>()
+             if (prefs.showLive) {
+                 for (sbn in nots) {
+                     val li = toLive(sbn)
+                     if (li != null && lives.size < 5) lives.add(li)
+                 }
+             }
+             IslandBus.lives = lives
              try {
                  val msm = getSystemService(MediaSessionManager::class.java)
                  IslandBus.media = msm.getActiveSessions(ComponentName(this, IslandNotifListener::class.java)).firstOrNull()
@@ -93,11 +136,18 @@ jobs:
          }
      }
      data class CallInfo(val name: String, val answer: Notification.Action, val decline: Notification.Action)
+     data class LiveInfo(
+         val key: String, val pkg: String, val label: String, val title: String, val text: String,
+         val chrono: Boolean, val countDown: Boolean, val base: Long,
+         val prog: Int, val pmax: Int, val indeterminate: Boolean,
+         val actions: List<Notification.Action>, val content: PendingIntent?)
      object IslandBus {
          @Volatile var call: CallInfo? = null
          @Volatile var recording = false
          @Volatile var media: MediaController? = null
+         @Volatile var lives: List<LiveInfo> = emptyList()
          var onChange: (() -> Unit)? = null
+         var requestRefresh: (() -> Unit)? = null
          fun notifyChanged() { onChange?.invoke() }
      }
      EOF_FILE
@@ -105,6 +155,8 @@ jobs:
      cat > app/src/main/java/com/island/app/IslandService.kt <<'EOF_FILE'
      package com.island.app
 
+     import android.animation.Animator
+     import android.animation.AnimatorListenerAdapter
      import android.animation.ValueAnimator
      import android.app.*
      import android.content.Intent
@@ -125,24 +177,36 @@ jobs:
          private lateinit var wm: WindowManager
          private lateinit var prefs: Prefs
          private lateinit var root: FrameLayout
+         private lateinit var island: FrameLayout
          private lateinit var lp: WindowManager.LayoutParams
-         private lateinit var left: ImageView
-         private lateinit var title: TextView
-         private lateinit var content: LinearLayout
+         private lateinit var iconView: ImageView
+         private lateinit var titleView: TextView
+         private lateinit var contentView: LinearLayout
+         private val bg = GradientDrawable()
+         private var chronoTv: TextView? = null
          private val h = Handler(Looper.getMainLooper())
          private var torchOn = false
          private var expanded = false
+         private var lastExpanded = false
          private var state = "idle"
+         private var lastSig = ""
          private var forced: String? = null
+         private var selId: String? = null
+         private var hiding = false
+         private var blurOn = false
+         private var slideDir = 0
+         private var demoBase = 0L
+         private var curAnim: ValueAnimator? = null
          private val ease = PathInterpolator(0.2f, 0.9f, 0.2f, 1f)
          private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-         private fun corner() = minOf(lp.height / 2f, dp(prefs.radius).toFloat())
+         private fun corner(hpx: Int) = minOf(hpx / 2f, dp(prefs.radius).toFloat())
 
          override fun onBind(i: Intent?): IBinder? = null
 
          override fun onCreate() {
              super.onCreate()
              prefs = Prefs(this)
+             demoBase = System.currentTimeMillis() + 300000L
              wm = getSystemService(WINDOW_SERVICE) as WindowManager
              getSystemService(NotificationManager::class.java)
                  .createNotificationChannel(NotificationChannel("island", "Dynamic Island", NotificationManager.IMPORTANCE_MIN))
@@ -152,22 +216,34 @@ jobs:
                  override fun onTorchModeChanged(id: String, on: Boolean) { torchOn = on; h.post { update() } }
              }, h)
              IslandBus.onChange = { h.post { update() } }
-             h.post(object : Runnable { override fun run() { if (state == "media" && expanded) updateProgress(); h.postDelayed(this, 1000) } })
+             h.post(object : Runnable { override fun run() { tick(); h.postDelayed(this, 1000) } })
+             h.post { update() }
          }
 
          private fun build() {
+             blurOn = false
+             hiding = false
              lp = WindowManager.LayoutParams(dp(prefs.width), dp(prefs.height),
                  WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                     WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                  PixelFormat.TRANSLUCENT).apply {
                  gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
                  x = dp(prefs.offsetX - 100); y = dp(prefs.topMargin)
              }
-             root = FrameLayout(this).apply {
-                 background = GradientDrawable().apply { setColor(Color.BLACK); cornerRadius = dp(prefs.height) / 2f }
-                 clipToOutline = true; visibility = View.GONE; alpha = 0f
+             bg.setColor(Color.BLACK)
+             bg.cornerRadius = dp(prefs.height) / 2f
+             bg.alpha = 255
+             island = FrameLayout(this).apply {
+                 background = bg
+                 clipToOutline = true
+                 visibility = View.GONE
+                 alpha = 0f
+                 layoutParams = FrameLayout.LayoutParams(dp(prefs.width), dp(prefs.height), Gravity.TOP or Gravity.CENTER_HORIZONTAL)
              }
+             root = FrameLayout(this)
+             root.addView(island)
              val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
                  override fun onDown(e: MotionEvent): Boolean = true
                  override fun onSingleTapUp(e: MotionEvent): Boolean { toggle(); return true }
@@ -176,112 +252,216 @@ jobs:
                      return false
                  }
              })
-             root.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
-             left = ImageView(this); title = TextView(this); content = LinearLayout(this)
+             root.setOnTouchListener { _, ev ->
+                 if (ev.action == MotionEvent.ACTION_OUTSIDE) {
+                     if (expanded) { expanded = false; render() }
+                     true
+                 } else gd.onTouchEvent(ev)
+             }
+             iconView = ImageView(this); titleView = TextView(this); contentView = LinearLayout(this)
              wm.addView(root, lp)
          }
 
          private fun destroyViews() {
+             val old = curAnim; curAnim = null; old?.cancel()
              try { wm.removeView(root) } catch (e: Exception) {}
          }
 
-         private var sel = 0
+         private fun isLive(id: String) = id.startsWith("live:")
+
+         private fun liveFor(id: String): LiveInfo? {
+             if (id == "live:demo") return LiveInfo("demo", packageName, "Таймер", "Таймер", "Демо: осталось 5 минут", true, true, demoBase, 0, 0, false, emptyList(), null)
+             return IslandBus.lives.firstOrNull { "live:" + it.key == id }
+         }
+
+         private fun fmtChrono(li: LiveInfo): String {
+             val now = System.currentTimeMillis()
+             val diff = if (li.countDown) li.base - now else now - li.base
+             val s = if (diff < 0L) 0L else diff / 1000L
+             val hr = s / 3600L
+             val mn = (s % 3600L) / 60L
+             val sc = s % 60L
+             return if (hr > 0L) String.format("%d:%02d:%02d", hr, mn, sc) else String.format("%02d:%02d", mn, sc)
+         }
+
+         private fun tick() {
+             val li = if (isLive(state)) liveFor(state) else null
+             if (li != null) {
+                 chronoTv?.text = fmtChrono(li)
+                 val pb = contentView.findViewWithTag<ProgressBar>("lbar")
+                 if (pb != null && li.pmax > 0) pb.progress = li.prog * 1000 / li.pmax
+             }
+             if (state == "media" && expanded) updateProgress()
+         }
+
          private fun activeList(): List<String> {
              forced?.let { return listOf(it) }
              val l = ArrayList<String>()
              if (prefs.showCalls && IslandBus.call != null) l.add("call")
              if (prefs.showRec && IslandBus.recording) l.add("rec")
              val md = if (prefs.showMedia) IslandBus.media else null
-             if (md != null && md.playbackState?.state == PlaybackState.STATE_PLAYING) l.add("media")
+             if (md != null) {
+                 val ps = md.playbackState?.state
+                 if (ps == PlaybackState.STATE_PLAYING || (ps == PlaybackState.STATE_PAUSED && state == "media")) l.add("media")
+             }
+             if (prefs.showLive) { for (li in IslandBus.lives) l.add("live:" + li.key) }
              if (prefs.showTorch && torchOn) l.add("torch")
              return l
          }
 
-         private fun update() {
-             val l = activeList()
-             if (sel >= l.size) sel = 0
-             val next = if (l.isEmpty()) "idle" else if (l.contains("call")) "call" else l[sel]
-             if (next != state) { state = next; expanded = next == "call"; render() }
+         private fun sigOf(id: String): String {
+             if (id == "call") return "call" + (IslandBus.call?.name ?: "")
+             if (id == "media") {
+                 val m = IslandBus.media
+                 return "media" + (m?.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "") + (m?.playbackState?.state ?: 0).toString()
+             }
+             if (isLive(id)) {
+                 val li = liveFor(id)
+                 if (li == null) return id
+                 return "live" + li.title + (if (li.chrono) "" else li.text)
+             }
+             return id
          }
 
-         // Свайп влево/вправо переключает активности, как в One UI 9.5
+         private fun update() {
+             val l = activeList()
+             val s = selId
+             val next = if (l.isEmpty()) "idle"
+                 else if (l.contains("call")) "call"
+                 else if (s != null && l.contains(s)) s
+                 else l[0]
+             val sig = if (next == "idle") "idle" else sigOf(next)
+             if (next != state) {
+                 state = next; expanded = next == "call"; lastSig = sig; render()
+             } else if (sig != lastSig) {
+                 lastSig = sig; render()
+             }
+         }
+
          private fun swipe(dir: Int) {
              val l = activeList()
              if (l.size < 2 || state == "call") return
-             sel = (sel + dir + l.size) % l.size
+             val i = l.indexOf(state)
+             val n = if (i < 0) 0 else (i + dir + l.size) % l.size
+             selId = l[n]
+             slideDir = dir
              update()
          }
 
          private fun render() {
              if (state == "idle") { hide(); return }
              show()
-             root.removeAllViews()
+             island.removeAllViews()
+             chronoTv = null
              val hh = dp(prefs.height); val pad = dp(3); val d = hh - 2 * pad
              val isMedia = state == "media"
+             val live: LiveInfo? = if (isLive(state)) liveFor(state) else null
              val lw = if (isMedia) (d * 1.55f).toInt() else d
-             left = ImageView(this).apply {
+             iconView = ImageView(this).apply {
                  scaleType = ImageView.ScaleType.CENTER_CROP; clipToOutline = true
                  background = GradientDrawable().apply { cornerRadius = if (isMedia) d * 0.42f else d / 2f; setColor(Color.DKGRAY) }
                  layoutParams = FrameLayout.LayoutParams(lw, d, Gravity.TOP or Gravity.START).apply { setMargins(pad, pad, 0, 0) }
              }
-             title = TextView(this).apply {
+             titleView = TextView(this).apply {
                  setTextColor(Color.WHITE); textSize = prefs.textSize.toFloat(); typeface = Typeface.DEFAULT_BOLD; maxLines = 1
                  ellipsize = android.text.TextUtils.TruncateAt.END; gravity = Gravity.CENTER_VERTICAL or Gravity.END
                  layoutParams = FrameLayout.LayoutParams(-2, hh, Gravity.TOP or Gravity.END).apply { marginEnd = dp(14) }
              }
-             content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(dp(18), hh + dp(8), dp(18), dp(14)) }
+             contentView = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18), hh + dp(8), dp(18), dp(14)) }
              var w = prefs.width; var stroke = 0
-             when (state) {
-                 "rec" -> { left.setImageDrawable(ringIcon()); title.text = "" }
-                 "torch" -> { left.setImageDrawable(torchIcon()); title.text = "Torch"; w += 20 }
-                 "media" -> {
+             when {
+                 state == "rec" -> { iconView.setImageDrawable(ringIcon()); titleView.text = "" }
+                 state == "torch" -> { iconView.setImageDrawable(torchIcon()); titleView.text = "Torch"; w += 20 }
+                 isMedia -> {
                      val meta = IslandBus.media?.metadata
-                     left.setImageBitmap(meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART))
-                     title.text = meta?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Media"
-                     title.maxWidth = dp(prefs.mediaWidth) - lw - dp(24)
+                     iconView.setImageBitmap(meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART))
+                     titleView.text = meta?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Media"
                      w = prefs.mediaWidth; stroke = Color.parseColor("#E91E63")
                  }
-                 "call" -> { left.setImageDrawable(oval("#34C759")); title.text = IslandBus.call?.name ?: "Входящий вызов"; w = prefs.mediaWidth }
+                 state == "call" -> { iconView.setImageDrawable(oval("#34C759")); titleView.text = IslandBus.call?.name ?: "Входящий вызов"; w = prefs.mediaWidth }
+                 live != null -> {
+                     iconView.setImageDrawable(appIcon(live.pkg))
+                     if (live.chrono) { titleView.text = fmtChrono(live); chronoTv = titleView } else { titleView.text = live.title }
+                     w = prefs.mediaWidth
+                 }
              }
-             (root.background as GradientDrawable).setStroke(if (stroke == 0) 0 else dp(2), stroke)
-             root.addView(left); root.addView(title); root.addView(content)
-             if (expanded) {
-                 title.layoutParams = FrameLayout.LayoutParams(-2, hh, Gravity.TOP or Gravity.START).apply { marginStart = hh + dp(8) }
-                 title.gravity = Gravity.CENTER_VERTICAL or Gravity.START
-                 content.visibility = View.VISIBLE
-                 fillContent()
-             }
+             bg.setStroke(if (stroke == 0) 0 else dp(2), stroke)
              val tw = if (expanded) resources.displayMetrics.widthPixels - dp(24) else dp(w)
-             val th = if (expanded) (if (state == "call") hh + dp(prefs.btnHeight + 24) else dp(prefs.cardHeight)) else hh
+             titleView.maxWidth = if (expanded) tw - hh - dp(24) else maxOf(dp(24), tw - lw - pad - dp(22))
+             island.addView(iconView); island.addView(titleView)
+             var th = hh
+             if (expanded) {
+                 titleView.layoutParams = FrameLayout.LayoutParams(-2, hh, Gravity.TOP or Gravity.START).apply { marginStart = hh + dp(8) }
+                 titleView.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                 fillContent(live)
+                 contentView.measure(View.MeasureSpec.makeMeasureSpec(tw, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+                 th = if (isMedia) dp(prefs.cardHeight) else maxOf(hh, contentView.measuredHeight)
+                 island.addView(contentView, FrameLayout.LayoutParams(tw, th, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+             }
+             val t0 = slideDir
+             slideDir = 0
+             if (t0 != 0) {
+                 for (v in listOf<View>(iconView, titleView)) {
+                     v.translationX = t0 * dp(28).toFloat()
+                     v.alpha = 0f
+                     v.animate().translationX(0f).alpha(1f).setDuration(prefs.animMs.toLong() * 3L / 5L).setInterpolator(ease).start()
+                 }
+             } else if (lastExpanded != expanded) {
+                 titleView.alpha = 0f
+                 titleView.animate().alpha(1f).setDuration(prefs.animMs.toLong()).start()
+             }
+             lastExpanded = expanded
              animateTo(tw, th)
          }
 
-         private fun fillContent() {
+         private fun fillContent(live: LiveInfo?) {
              if (state == "call") {
                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
                  row.addView(pill(prefs.decLabel, "#FF3B30") { IslandBus.call?.decline?.actionIntent?.send(); finishCall() })
                  row.addView(View(this), LinearLayout.LayoutParams(dp(16), 1))
                  row.addView(pill(prefs.ansLabel, "#34C759") { IslandBus.call?.answer?.actionIntent?.send(); finishCall() })
-                 content.addView(row, LinearLayout.LayoutParams(-1, dp(prefs.btnHeight)))
+                 contentView.addView(row, LinearLayout.LayoutParams(-1, dp(prefs.btnHeight)))
              } else if (state == "media") {
                  val md = IslandBus.media
-                 if (prefs.showArtist) content.addView(TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 12f; text = md?.metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "" })
-                 if (prefs.showProgress) content.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { tag = "bar"; max = 1000 }, LinearLayout.LayoutParams(-1, dp(10)))
+                 if (prefs.showArtist) contentView.addView(TextView(this).apply { setTextColor(Color.LTGRAY); textSize = 12f; text = md?.metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "" })
+                 if (prefs.showProgress) contentView.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { tag = "bar"; max = 1000 }, LinearLayout.LayoutParams(-1, dp(10)))
                  if (prefs.showControls) {
+                     val playing = md?.playbackState?.state == PlaybackState.STATE_PLAYING
                      val ctl = LinearLayout(this).apply { gravity = Gravity.CENTER }
                      fun b(s: String, f: () -> Unit) = TextView(this).apply { text = s; textSize = 26f; setTextColor(Color.WHITE); setPadding(dp(22), 0, dp(22), 0); setOnClickListener { f() } }
                      ctl.addView(b("⏮") { IslandBus.media?.transportControls?.skipToPrevious() })
-                     ctl.addView(b("⏯") {
+                     ctl.addView(b(if (playing) "⏸" else "▶") {
                          val m = IslandBus.media
                          if (m != null) {
                              if (m.playbackState?.state == PlaybackState.STATE_PLAYING) m.transportControls.pause() else m.transportControls.play()
                          }
                      })
                      ctl.addView(b("⏭") { IslandBus.media?.transportControls?.skipToNext() })
-                     content.addView(ctl)
+                     contentView.addView(ctl)
                  }
+             } else if (live != null) {
+                 if (live.chrono) contentView.addView(TextView(this).apply { text = live.title; textSize = 15f; typeface = Typeface.DEFAULT_BOLD; setTextColor(Color.WHITE) })
+                 if (live.text.isNotEmpty()) contentView.addView(TextView(this).apply { text = live.text; textSize = 13f; setTextColor(Color.LTGRAY) })
+                 if (live.pmax > 0 || live.indeterminate) {
+                     val pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                     pb.tag = "lbar"
+                     pb.max = 1000
+                     pb.isIndeterminate = live.indeterminate
+                     if (live.pmax > 0) pb.progress = live.prog * 1000 / live.pmax
+                     contentView.addView(pb, LinearLayout.LayoutParams(-1, dp(10)).apply { topMargin = dp(8) })
+                 }
+                 val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+                 for (a in live.actions.take(2)) {
+                     val label = a.title?.toString() ?: ""
+                     if (label.isNotEmpty()) row.addView(smallPill(label, "#33FFFFFF") { try { a.actionIntent?.send() } catch (e: Exception) {} })
+                 }
+                 val ci = live.content
+                 if (ci != null) row.addView(smallPill("Открыть", "#0381FE") { try { ci.send() } catch (e: Exception) {}; collapse() })
+                 if (row.childCount > 0) contentView.addView(row, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(10) })
              }
          }
+
+         private fun collapse() { expanded = false; render() }
 
          private fun finishCall() { forced = null; expanded = false; state = "idle"; h.postDelayed({ update() }, 250) }
 
@@ -289,13 +469,22 @@ jobs:
              val m = IslandBus.media ?: return
              val dur: Long = m.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
              val pos: Long = m.playbackState?.position ?: 0L
-             content.findViewWithTag<ProgressBar>("bar")?.progress = if (dur > 0L) (pos * 1000L / dur).toInt() else 0
+             contentView.findViewWithTag<ProgressBar>("bar")?.progress = if (dur > 0L) (pos * 1000L / dur).toInt() else 0
          }
 
          private fun pill(t: String, color: String, f: () -> Unit) = TextView(this).apply {
              text = t; setTextColor(Color.WHITE); textSize = 16f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
              background = GradientDrawable().apply { setColor(Color.parseColor(color)); cornerRadius = dp(prefs.btnHeight) / 2f }
              layoutParams = LinearLayout.LayoutParams(0, -1, 1f); setOnClickListener { f() }
+         }
+         private fun smallPill(t: String, color: String, f: () -> Unit) = TextView(this).apply {
+             text = t; setTextColor(Color.WHITE); textSize = 14f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER; maxLines = 1
+             background = GradientDrawable().apply { setColor(Color.parseColor(color)); cornerRadius = dp(20).toFloat() }
+             layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply { setMargins(dp(4), 0, dp(4), 0) }
+             setOnClickListener { f() }
+         }
+         private fun appIcon(pkg: String): Drawable {
+             return try { packageManager.getApplicationIcon(pkg) } catch (e: Exception) { oval("#555555") }
          }
          private fun ringIcon(): Drawable {
              val r = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.TRANSPARENT); setStroke(dp(2), Color.WHITE) }
@@ -307,39 +496,133 @@ jobs:
          }
          private fun oval(c: String): GradientDrawable = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor(c)) }
 
-         private fun toggle() { if (state != "media") return; expanded = !expanded; render() }
+         private fun toggle() {
+             if (!(state == "media" || state == "call" || isLive(state))) return
+             expanded = !expanded
+             render()
+         }
 
-         private fun animateTo(w: Int, hg: Int) {
-             val ow = lp.width; val oh = lp.height
-             ValueAnimator.ofFloat(0f, 1f).apply {
-                 duration = prefs.animMs.toLong()
-                 interpolator = if (expanded) OvershootInterpolator(1.1f) else ease
-                 addUpdateListener { a ->
-                     val f = a.animatedValue as Float
-                     lp.width = (ow + (w - ow) * f).toInt(); lp.height = (oh + (hg - oh) * f).toInt()
-                     (root.background as GradientDrawable).cornerRadius = corner()
-                     try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
+         private fun setWindow(w: Int, hgt: Int) {
+             if (lp.width == w && lp.height == hgt) return
+             lp.width = w; lp.height = hgt
+             try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
+         }
+
+         private fun setIsland(w: Int, hgt: Int) {
+             val p = island.layoutParams
+             p.width = w; p.height = hgt
+             island.layoutParams = p
+         }
+
+         private fun setBlur(on: Boolean) {
+             if (Build.VERSION.SDK_INT < 31) return
+             if (blurOn == on) return
+             blurOn = on
+             val f = WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+             if (on) {
+                 lp.flags = lp.flags or f
+                 lp.blurBehindRadius = dp(prefs.blurRadius)
+             } else {
+                 lp.flags = lp.flags and f.inv()
+                 lp.blurBehindRadius = 0
+             }
+             try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
+         }
+
+         private fun fadeBlur() {
+             if (Build.VERSION.SDK_INT < 31) return
+             if (!prefs.liveBlur || blurOn || state == "idle") return
+             if (!wm.isCrossWindowBlurEnabled) return
+             setBlur(true)
+             val va = ValueAnimator.ofInt(255, 175)
+             va.duration = 180L
+             va.addUpdateListener { x -> bg.alpha = x.animatedValue as Int }
+             va.start()
+         }
+
+         private fun animateTo(tw: Int, th: Int) {
+             val lpI = island.layoutParams
+             val ow = if (lpI.width > 0) lpI.width else tw
+             val oh = if (lpI.height > 0) lpI.height else th
+             val prev = curAnim; curAnim = null; prev?.cancel()
+             if (ow == tw && oh == th) {
+                 bg.cornerRadius = corner(th)
+                 island.invalidateOutline()
+                 contentView.alpha = 1f
+                 setWindow(tw, th)
+                 if (expanded) fadeBlur()
+                 return
+             }
+             setBlur(false)
+             bg.alpha = 255
+             val extra = dp(24)
+             setWindow(maxOf(lp.width, tw, ow) + extra, maxOf(lp.height, th, oh) + extra)
+             val growing = tw.toLong() * th >= ow.toLong() * oh
+             val a = ValueAnimator.ofFloat(0f, 1f)
+             a.duration = prefs.animMs.toLong()
+             a.interpolator = if (growing) OvershootInterpolator(1.1f) else ease
+             a.addUpdateListener { v ->
+                 val f = v.animatedValue as Float
+                 val cw = (ow + (tw - ow) * f).toInt()
+                 val ch = (oh + (th - oh) * f).toInt()
+                 setIsland(cw, ch)
+                 bg.cornerRadius = corner(ch)
+                 island.invalidateOutline()
+                 val ca = if (growing) (f - 0.35f) / 0.65f else 1f - f * 2f
+                 contentView.alpha = ca.coerceIn(0f, 1f)
+             }
+             a.addListener(object : AnimatorListenerAdapter() {
+                 override fun onAnimationEnd(an: Animator) {
+                     if (curAnim === a) {
+                         setIsland(tw, th)
+                         setWindow(tw, th)
+                         if (expanded) fadeBlur()
+                     }
                  }
-                 start()
-             }
+             })
+             curAnim = a
+             a.start()
          }
+
          private fun show() {
-             if (root.visibility != View.VISIBLE) {
-                 root.visibility = View.VISIBLE; root.scaleX = .6f; root.scaleY = .6f
-                 root.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(prefs.animMs.toLong()).setInterpolator(OvershootInterpolator(1.4f)).start()
+             hiding = false
+             if (island.visibility != View.VISIBLE) {
+                 island.visibility = View.VISIBLE; island.alpha = 0f; island.scaleX = .6f; island.scaleY = .6f
+             }
+             if (island.alpha < 1f || island.scaleX < 1f) {
+                 island.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(prefs.animMs.toLong()).setInterpolator(OvershootInterpolator(1.4f)).start()
              }
          }
+
          private fun hide() {
-             root.animate().alpha(0f).scaleX(.6f).scaleY(.6f).setDuration(220L).withEndAction {
-                 root.visibility = View.GONE; lp.width = dp(prefs.width); lp.height = dp(prefs.height)
-                 try { wm.updateViewLayout(root, lp) } catch (e: Exception) {}
+             hiding = true
+             expanded = false
+             lastExpanded = false
+             val prev = curAnim; curAnim = null; prev?.cancel()
+             setBlur(false)
+             bg.alpha = 255
+             island.animate().alpha(0f).scaleX(.6f).scaleY(.6f).setDuration(220L).withEndAction {
+                 if (hiding) {
+                     island.visibility = View.GONE
+                     setIsland(dp(prefs.width), dp(prefs.height))
+                     setWindow(dp(prefs.width), dp(prefs.height))
+                 }
              }.start()
          }
 
          override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
              val act = i?.action
-             if (act == "reload") { destroyViews(); build(); state = "x"; update() }
-             else if (act == "test") { val t = i?.getStringExtra("s"); forced = if (t == "off") null else t; state = "x"; update() }
+             if (act == "reload") {
+                 destroyViews(); build(); state = "x"; lastSig = ""
+                 IslandBus.requestRefresh?.invoke()
+                 update()
+             } else if (act == "test") {
+                 val t = i?.getStringExtra("s")
+                 if (t == "live:demo") demoBase = System.currentTimeMillis() + 300000L
+                 forced = if (t == "off") null else t
+                 state = "x"; lastSig = ""
+                 update()
+             }
              return START_STICKY
          }
          override fun onDestroy() {
@@ -387,6 +670,9 @@ jobs:
          var animMs: Int
              get() = i("anim", 380)
              set(v) { s("anim", v) }
+         var blurRadius: Int
+             get() = i("blr", 24)
+             set(v) { s("blr", v) }
          var showMedia: Boolean
              get() = b("media", true)
              set(v) { sb("media", v) }
@@ -399,6 +685,15 @@ jobs:
          var showRec: Boolean
              get() = b("rec", true)
              set(v) { sb("rec", v) }
+         var showLive: Boolean
+             get() = b("live", true)
+             set(v) { sb("live", v) }
+         var allOngoing: Boolean
+             get() = b("allon", false)
+             set(v) { sb("allon", v) }
+         var liveBlur: Boolean
+             get() = b("lblur", true)
+             set(v) { sb("lblur", v) }
          var showArtist: Boolean
              get() = b("artist", true)
              set(v) { sb("artist", v) }
@@ -409,7 +704,7 @@ jobs:
              get() = b("ctl", true)
              set(v) { sb("ctl", v) }
          var blurApp: Boolean
-             get() = b("blur", true)
+             get() = b("blur", false)
              set(v) { sb("blur", v) }
          var ansLabel: String
              get() = p.getString("ans", "Ответить") ?: "Ответить"
@@ -454,7 +749,7 @@ jobs:
              if (Build.VERSION.SDK_INT >= 31 && p.blurApp) blur = getSystemService(WindowManager::class.java).isCrossWindowBlurEnabled
              if (blur && Build.VERSION.SDK_INT >= 31) {
                  window.setBackgroundDrawable(ColorDrawable(Color.parseColor("#8CEEF2FB")))
-                 window.setBackgroundBlurRadius(120)
+                 window.setBackgroundBlurRadius(60)
              } else window.setBackgroundDrawable(ColorDrawable(Color.parseColor("#F2F4FA")))
 
              val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(84), dp(16), dp(40)) }
@@ -472,6 +767,7 @@ jobs:
              col.addView(card(
                  testRow("Звонок" to "call", "Плеер" to "media"),
                  testRow("Фонарик" to "torch", "Запись" to "rec"),
+                 testRow("Таймер" to "live:demo"),
                  pillBtn("Выключить тест") { test("off") }))
 
              col.addView(label("ЧТО ПОКАЗЫВАТЬ"))
@@ -479,7 +775,9 @@ jobs:
                  sw("Медиаплеер", { p.showMedia }) { p.showMedia = it },
                  sw("Звонки (Ответить / Отклонить)", { p.showCalls }) { p.showCalls = it },
                  sw("Фонарик", { p.showTorch }) { p.showTorch = it },
-                 sw("Запись экрана", { p.showRec }) { p.showRec = it }))
+                 sw("Запись экрана", { p.showRec }) { p.showRec = it },
+                 sw("Таймер, навигация, загрузки (Live)", { p.showLive }) { p.showLive = it },
+                 sw("Все постоянные уведомления", { p.allOngoing }) { p.allOngoing = it }))
 
              col.addView(label("КАРТОЧКА ПЛЕЕРА"))
              col.addView(card(
@@ -504,8 +802,16 @@ jobs:
                  seek("Скругление", 40, { p.radius }, { p.radius = it }),
                  seek("Размер текста", 24, { p.textSize }, { p.textSize = it })))
 
-             col.addView(label("АНИМАЦИЯ"))
-             col.addView(card(seek("Длительность (мс)", 1000, { p.animMs }, { p.animMs = it })))
+             col.addView(label("АНИМАЦИЯ И РАЗМЫТИЕ"))
+             col.addView(card(
+                 seek("Длительность (мс)", 1000, { p.animMs }, { p.animMs = it }),
+                 sw("Live Blur раскрытой карточки", { p.liveBlur }) { p.liveBlur = it },
+                 seek("Сила размытия (dp)", 60, { p.blurRadius }, { p.blurRadius = it })))
+
+             col.addView(label("SAMSUNG NOW BAR"))
+             col.addView(card(
+                 note("Модуль KernelSU при загрузке пытается отключить пакеты Now Bar. Результат: /data/local/tmp/island_nowbar.log. Вручную: Настройки, Экран блокировки, Now Bar."),
+                 pillBtn("Открыть настройки") { startActivity(Intent(Settings.ACTION_SETTINGS)) }))
 
              col.addView(label("ИНТЕРФЕЙС ПРИЛОЖЕНИЯ"))
              col.addView(card(sw("Размытие фона (как в One UI)", { p.blurApp }, { recreate() }) { p.blurApp = it }))
@@ -519,6 +825,10 @@ jobs:
 
          private fun label(t: String) = TextView(this).apply {
              text = t; textSize = 13f; setTextColor(Color.parseColor("#6B7280")); typeface = Typeface.DEFAULT_BOLD; setPadding(dp(10), dp(18), 0, dp(8))
+         }
+
+         private fun note(t: String) = TextView(this).apply {
+             text = t; textSize = 13f; setTextColor(Color.parseColor("#6B7280")); setPadding(dp(4), dp(8), dp(4), dp(4))
          }
 
          private fun card(vararg v: View) = LinearLayout(this).apply {
@@ -624,10 +934,10 @@ jobs:
      cat > module/module.prop <<'EOF_FILE'
      id=dynamic_island
      name=Dynamic Island
-     version=v1.0
-     versionCode=1
+     version=v1.1
+     versionCode=2
      author=you
-     description=Динамический остров: медиа, звонки (Ответить/Отклонить), фонарик, запись экрана.
+     description=Динамический остров: медиа, звонки, таймер, навигация, фонарик, запись экрана, Live Blur.
      EOF_FILE
      mkdir -p $(dirname module/service.sh)
      cat > module/service.sh <<'EOF_FILE'
@@ -639,6 +949,14 @@ jobs:
      pm grant com.island.app android.permission.POST_NOTIFICATIONS
      appops set com.island.app SYSTEM_ALERT_WINDOW allow
      cmd notification allow_listener com.island.app/com.island.app.IslandNotifListener
+     LOG=/data/local/tmp/island_nowbar.log
+     : > $LOG
+     if [ ! -f /data/adb/island_keep_nowbar ]; then
+       for P in $(pm list packages | sed 's/^package://' | grep -iE 'nowbar|now_bar|nowbrief'); do
+         echo "disable $P" >> $LOG
+         pm disable-user --user 0 $P >> $LOG 2>&1
+       done
+     fi
      am start-foreground-service -n com.island.app/.IslandService
      EOF_FILE
      mkdir -p $(dirname module/system/etc/permissions/privapp-permissions-com.island.app.xml)
