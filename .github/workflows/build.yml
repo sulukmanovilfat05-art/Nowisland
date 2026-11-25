@@ -217,10 +217,11 @@ jobs:
              show()
              root.removeAllViews()
              val hh = dp(prefs.height); val pad = dp(3); val d = hh - 2 * pad
-             val lw = if (state == "media") (d * 1.55f).toInt() else d
+             val isMedia = state == "media"
+             val lw = if (isMedia) (d * 1.55f).toInt() else d
              left = ImageView(this).apply {
                  scaleType = ImageView.ScaleType.CENTER_CROP; clipToOutline = true
-                 background = GradientDrawable().apply { cornerRadius = if (state == "media") d * 0.42f else d / 2f; setColor(Color.DKGRAY) }
+                 background = GradientDrawable().apply { cornerRadius = if (isMedia) d * 0.42f else d / 2f; setColor(Color.DKGRAY) }
                  layoutParams = FrameLayout.LayoutParams(lw, d, Gravity.TOP or Gravity.START).apply { setMargins(pad, pad, 0, 0) }
              }
              title = TextView(this).apply {
